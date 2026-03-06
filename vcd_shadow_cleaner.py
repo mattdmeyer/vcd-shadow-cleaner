@@ -78,6 +78,7 @@ class ShadowVM:
     datastore_name: str
     vm_id: str
     primary_vm_href: str # Link to the primary VM
+    catalog_name: str = ""
 
 
 @dataclass
@@ -369,13 +370,23 @@ class VCDClient:
     def _get_shared_catalogs_for_org(self, org_name: str) -> List[dict]:
         """Get catalogs that are shared/published and accessible to the specified org."""
         catalogs = []
+        page = 1
+        page_size = 100
+
         try:
-            # Query for published catalogs (these are available to all orgs)
-            uri = f"https://{self.host}/api/query?type=adminCatalog&format=records&filter=isPublished==true"
-            response = self.session.get(uri, headers=self._get_headers())
-            if response.status_code == 200:
+            while True:
+                uri = f"https://{self.host}/api/query?type=adminCatalog&format=records&filter=isPublished==true&page={page}&pageSize={page_size}"
+                response = self.session.get(uri, headers=self._get_headers())
+                if response.status_code != 200:
+                    break
+
                 data = response.json()
-                for record in data.get("record", []):
+                records = data.get("record", [])
+
+                if not records:
+                    break
+
+                for record in records:
                     catalogs.append({
                         "name": record.get("name"),
                         "href": record.get("href"),
@@ -383,26 +394,49 @@ class VCDClient:
                         "isShared": True,
                         "isPublished": True,
                     })
+
+                total_records = int(data.get("total", 0))
+                if len(catalogs) >= total_records or len(records) < page_size:
+                    break
+
+                page += 1
+
         except Exception as e:
             print(f"Error fetching shared catalogs: {e}")
         return catalogs
 
     def get_datastores(self) -> List[dict]:
         """Get list of datastores (requires provider-level access)."""
+        datastores = []
+        page = 1
+        page_size = 100
+
         try:
-            uri = f"https://{self.host}/api/query?type=datastore&format=records"
-            response = self.session.get(uri, headers=self._get_headers())
-            response.raise_for_status()
-            
-            data = response.json()
-            datastores = []
-            for record in data.get("record", []):
-                datastores.append({
-                    "name": record.get("name"),
-                    "href": record.get("href"),
-                    "vcName": record.get("vcName", ""),
-                    "datastoreType": record.get("datastoreType", "")
-                })
+            while True:
+                uri = f"https://{self.host}/api/query?type=datastore&format=records&page={page}&pageSize={page_size}"
+                response = self.session.get(uri, headers=self._get_headers())
+                response.raise_for_status()
+
+                data = response.json()
+                records = data.get("record", [])
+
+                if not records:
+                    break
+
+                for record in records:
+                    datastores.append({
+                        "name": record.get("name"),
+                        "href": record.get("href"),
+                        "vcName": record.get("vcName", ""),
+                        "datastoreType": record.get("datastoreType", "")
+                    })
+
+                total_records = int(data.get("total", 0))
+                if len(datastores) >= total_records or len(records) < page_size:
+                    break
+
+                page += 1
+
             return sorted(datastores, key=lambda x: x.get("name", ""))
         except Exception as e:
             print(f"Failed to get datastores: {e}")
@@ -410,20 +444,36 @@ class VCDClient:
 
     def get_vapp_templates_in_catalog(self, catalog_name: str) -> List[VAppTemplate]:
         """Get all vApp templates in a specific catalog."""
+        templates = []
+        page = 1
+        page_size = 100
+
         try:
-            uri = f"https://{self.host}/api/query?type=adminVAppTemplate&format=records&filter=catalogName=={catalog_name}"
-            response = self.session.get(uri, headers=self._get_headers())
-            response.raise_for_status()
-            
-            data = response.json()
-            templates = []
-            for record in data.get("record", []):
-                templates.append(VAppTemplate(
-                    name=record.get("name", ""),
-                    href=record.get("href", ""),
-                    id=record.get("id", "") or record.get("href", ""),
-                    catalog_name=record.get("catalogName", "")
-                ))
+            while True:
+                uri = f"https://{self.host}/api/query?type=adminVAppTemplate&format=records&filter=catalogName=={catalog_name}&page={page}&pageSize={page_size}"
+                response = self.session.get(uri, headers=self._get_headers())
+                response.raise_for_status()
+
+                data = response.json()
+                records = data.get("record", [])
+
+                if not records:
+                    break
+
+                for record in records:
+                    templates.append(VAppTemplate(
+                        name=record.get("name", ""),
+                        href=record.get("href", ""),
+                        id=record.get("id", "") or record.get("href", ""),
+                        catalog_name=record.get("catalogName", "")
+                    ))
+
+                total_records = int(data.get("total", 0))
+                if len(templates) >= total_records or len(records) < page_size:
+                    break
+
+                page += 1
+
             return templates
         except Exception as e:
             print(f"Failed to get vApp templates: {e}")
@@ -528,78 +578,91 @@ class VCDClient:
             self.current_org = None
 
 
-def scan_shadow_vms(client: VCDClient, catalog_name: str, datastore_name: str, debug: bool = True) -> List[ShadowVM]:
+def scan_shadow_vms(client: VCDClient, catalog_names: List[str], datastore_name: str, debug: bool = True) -> List[ShadowVM]:
     """
-    Scan for Shadow VMs on a datastore that belong to templates in a catalog.
-    
+    Scan for Shadow VMs on a datastore that belong to templates in one or more catalogs.
+
+    Args:
+        client: Authenticated VCDClient
+        catalog_names: List of catalog names (or a single name) to scan
+        datastore_name: Datastore to scan for shadow VMs
+        debug: Enable debug output
+
     Returns:
-        List of matching shadow VMs
+        List of matching shadow VMs with catalog_name populated
     """
+    if isinstance(catalog_names, str):
+        catalog_names = [catalog_names]
+
     print(f"\nScanning for Shadow VMs...")
-    print(f"  Catalog: {catalog_name}")
+    print(f"  Catalogs: {', '.join(catalog_names)}")
     print(f"  Datastore: {datastore_name}")
-    
-    # Get templates in the catalog
-    templates = client.get_vapp_templates_in_catalog(catalog_name)
-    template_names = {t.name for t in templates}
-    # Create a mapping of template HREFs and IDs to their names
-    template_ids = {}
-    for t in templates:
-        if t.href:
-            template_ids[t.href] = t.name
-        if t.id:
-            template_ids[t.id] = t.name
-            
-    print(f"  Found {len(templates)} templates in catalog")
-    if debug and templates:
-        print(f"  DEBUG: Sample template names: {list(template_names)[:5]}")
-        print(f"  DEBUG: Sample template IDs: {list(template_ids.keys())[:2]}")
-    
-    # Get Shadow VMs on the datastore (with debug enabled to see field structure)
+
+    # Build combined lookup structures across all catalogs
+    # Maps template HREF/ID -> (template_name, catalog_name)
+    template_ids: dict[str, tuple[str, str]] = {}
+    # Maps template name -> catalog_name (first catalog wins for name-based matching)
+    template_name_to_catalog: dict[str, str] = {}
+
+    for cat_name in catalog_names:
+        templates = client.get_vapp_templates_in_catalog(cat_name)
+        print(f"  Found {len(templates)} templates in catalog '{cat_name}'")
+        if debug and templates:
+            print(f"  DEBUG: Sample template names ({cat_name}): {[t.name for t in templates[:5]]}")
+
+        for t in templates:
+            if t.href:
+                template_ids[t.href] = (t.name, cat_name)
+            if t.id:
+                template_ids[t.id] = (t.name, cat_name)
+            if t.name not in template_name_to_catalog:
+                template_name_to_catalog[t.name] = cat_name
+
+    template_names = set(template_name_to_catalog.keys())
+
     all_shadows = client.get_shadow_vms_on_datastore(datastore_name, debug=debug)
     print(f"  Found {len(all_shadows)} Shadow VMs on datastore")
-    
+
     if debug and all_shadows:
-        # Show sample shadow VM info for debugging
         print(f"  DEBUG: Sample Shadow VM container_names: {[s.container_name for s in all_shadows[:5]]}")
         print(f"  DEBUG: Sample Shadow VM container_ids: {[s.container_id for s in all_shadows[:5]]}")
         print(f"  DEBUG: Sample Shadow VM names: {[s.name for s in all_shadows[:5]]}")
-    
-    # Try multiple matching strategies
+
     matching_shadows = []
-    
-    # Strategy 1: Direct container_id match (HREF/ID)
+
     for shadow in all_shadows:
+        # Strategy 1: Direct container_id match (HREF/ID)
         if shadow.container_id and shadow.container_id in template_ids:
-            # Update the container_name for display purposes
-            shadow.container_name = template_ids[shadow.container_id]
+            tpl_name, cat_name = template_ids[shadow.container_id]
+            shadow.container_name = tpl_name
+            shadow.catalog_name = cat_name
             matching_shadows.append(shadow)
             continue
 
         # Strategy 2: Direct container_name match
         if shadow.container_name in template_names:
+            shadow.catalog_name = template_name_to_catalog[shadow.container_name]
             matching_shadows.append(shadow)
             continue
-            
-        # Strategy 3: Check if shadow VM name starts with any template name
-        # Shadow VMs are often named like "TemplateName-shadow-1" or similar
-        for template_name in template_names:
-            if shadow.name.startswith(template_name) or template_name in shadow.name:
-                # Update the container_name for display purposes
-                shadow.container_name = template_name
+
+        # Strategy 3: Check if shadow VM name contains any template name
+        for tpl_name in template_names:
+            if shadow.name.startswith(tpl_name) or tpl_name in shadow.name:
+                shadow.container_name = tpl_name
+                shadow.catalog_name = template_name_to_catalog[tpl_name]
                 matching_shadows.append(shadow)
                 break
-    
-    # Remove duplicates (in case both strategies matched)
+
+    # Deduplicate by href
     seen_hrefs = set()
     unique_shadows = []
     for s in matching_shadows:
         if s.href not in seen_hrefs:
             seen_hrefs.add(s.href)
             unique_shadows.append(s)
-    
+
     print(f"  Matched {len(unique_shadows)} Shadow VMs to catalog templates")
-    
+
     return unique_shadows
 
 
@@ -612,24 +675,29 @@ def print_shadow_vm_table(shadows: List[ShadowVM]):
     # Calculate column widths
     name_width = max(len(s.name) for s in shadows)
     name_width = max(name_width, len("Shadow VM Name"))
-    
+
     template_width = max(len(s.container_name) for s in shadows)
     template_width = max(template_width, len("Parent Template"))
-    
+
+    cat_width = max(len(s.catalog_name) for s in shadows)
+    cat_width = max(cat_width, len("Catalog"))
+
     ds_width = max(len(s.datastore_name) for s in shadows)
     ds_width = max(ds_width, len("Datastore"))
-    
+
+    total_width = name_width + template_width + cat_width + ds_width + 13
+
     # Print header
-    print("\n" + "=" * (name_width + template_width + ds_width + 10))
-    print(f"| {'Shadow VM Name':<{name_width}} | {'Parent Template':<{template_width}} | {'Datastore':<{ds_width}} |")
-    print("|" + "-" * (name_width + 2) + "|" + "-" * (template_width + 2) + "|" + "-" * (ds_width + 2) + "|")
-    
+    print("\n" + "=" * total_width)
+    print(f"| {'Shadow VM Name':<{name_width}} | {'Parent Template':<{template_width}} | {'Catalog':<{cat_width}} | {'Datastore':<{ds_width}} |")
+    print("|" + "-" * (name_width + 2) + "|" + "-" * (template_width + 2) + "|" + "-" * (cat_width + 2) + "|" + "-" * (ds_width + 2) + "|")
+
     # Print rows
     for shadow in shadows:
-        print(f"| {shadow.name:<{name_width}} | {shadow.container_name:<{template_width}} | {shadow.datastore_name:<{ds_width}} |")
-    
+        print(f"| {shadow.name:<{name_width}} | {shadow.container_name:<{template_width}} | {shadow.catalog_name:<{cat_width}} | {shadow.datastore_name:<{ds_width}} |")
+
     # Print footer
-    print("=" * (name_width + template_width + ds_width + 10))
+    print("=" * total_width)
     print(f"\nTotal Shadow VMs: {len(shadows)}")
 
 
@@ -666,8 +734,9 @@ def run_cli(args):
         print(f"Switching to tenant: {args.tenant}")
         client.switch_to_org(args.tenant)
     
-    # Scan for Shadow VMs
-    shadows = scan_shadow_vms(client, args.catalog, args.datastore)
+    # Scan for Shadow VMs (support comma-separated catalog names from CLI)
+    catalog_names = [c.strip() for c in args.catalog.split(",")]
+    shadows = scan_shadow_vms(client, catalog_names, args.datastore)
     
     # Print results
     print_shadow_vm_table(shadows)
@@ -716,17 +785,158 @@ def run_gui():
     try:
         from PySide6.QtWidgets import (
             QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-            QLabel, QLineEdit, QPushButton, QComboBox, QTableWidget,
-            QTableWidgetItem, QGroupBox, QFormLayout, QProgressBar,
-            QMessageBox, QCheckBox, QTextEdit, QSplitter, QHeaderView,
-            QStatusBar, QFrame
+            QLabel, QLineEdit, QPushButton, QComboBox, QTableView,
+            QGroupBox, QFormLayout, QProgressBar,
+            QMessageBox, QCheckBox, QTextEdit, QHeaderView,
+            QFrame, QListWidget, QListWidgetItem,
+            QDialog, QDialogButtonBox, QAbstractItemView, QMenu
         )
-        from PySide6.QtCore import Qt, QThread, Signal
-        from PySide6.QtGui import QFont, QPalette, QColor, QIcon
+        from PySide6.QtCore import (
+            Qt, QThread, Signal, QSortFilterProxyModel, QModelIndex
+        )
+        from PySide6.QtGui import (
+            QFont, QPalette, QColor, QIcon, QStandardItemModel, QStandardItem,
+            QAction
+        )
     except ImportError:
         print("ERROR: PySide6 is required for GUI mode.")
         print("Install it with: pip install PySide6")
         return 1
+
+    SHADOW_VM_ROLE = Qt.ItemDataRole.UserRole + 1
+    COL_CHECK = 0
+    COL_CATALOG = 1
+    COL_TEMPLATE = 2
+    COL_VMNAME = 3
+    COL_DATASTORE = 4
+    COLUMN_HEADERS = ["", "Catalog", "Parent Template", "Shadow VM Name", "Datastore"]
+    FILTERABLE_COLUMNS = {COL_CATALOG, COL_TEMPLATE, COL_DATASTORE}
+
+    class ColumnFilterProxyModel(QSortFilterProxyModel):
+        """Proxy that filters rows based on per-column allowed-value sets."""
+
+        def __init__(self, parent=None):
+            super().__init__(parent)
+            self._filters: dict[int, set[str]] = {}
+
+        def set_column_filter(self, col: int, allowed: set[str] | None):
+            if allowed is None:
+                self._filters.pop(col, None)
+            else:
+                self._filters[col] = allowed
+            self.invalidateFilter()
+
+        def clear_all_filters(self):
+            self._filters.clear()
+            self.invalidateFilter()
+
+        def active_filters(self) -> dict[int, set[str]]:
+            return dict(self._filters)
+
+        def filterAcceptsRow(self, source_row: int, source_parent: QModelIndex) -> bool:
+            model = self.sourceModel()
+            for col, allowed in self._filters.items():
+                idx = model.index(source_row, col)
+                value = model.data(idx, Qt.ItemDataRole.DisplayRole) or ""
+                if value not in allowed:
+                    return False
+            return True
+
+    class FilterPopupDialog(QDialog):
+        """Excel-style multi-select filter popup for a column."""
+
+        def __init__(self, parent, title: str, all_values: list[str], checked_values: set[str] | None):
+            super().__init__(parent)
+            self.setWindowTitle(f"Filter: {title}")
+            self.setMinimumSize(280, 350)
+            self.result_set: set[str] | None = None
+
+            layout = QVBoxLayout(self)
+
+            btn_row = QHBoxLayout()
+            select_all_btn = QPushButton("Select All")
+            select_all_btn.clicked.connect(self._select_all)
+            deselect_all_btn = QPushButton("Deselect All")
+            deselect_all_btn.clicked.connect(self._deselect_all)
+            clear_filter_btn = QPushButton("Clear Filter")
+            clear_filter_btn.clicked.connect(self._clear_filter)
+            btn_row.addWidget(select_all_btn)
+            btn_row.addWidget(deselect_all_btn)
+            btn_row.addWidget(clear_filter_btn)
+            layout.addLayout(btn_row)
+
+            self._list = QListWidget()
+            self._list.setSelectionMode(QListWidget.SelectionMode.NoSelection)
+            sorted_values = sorted(set(all_values))
+            for val in sorted_values:
+                item = QListWidgetItem(val)
+                item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+                if checked_values is None or val in checked_values:
+                    item.setCheckState(Qt.CheckState.Checked)
+                else:
+                    item.setCheckState(Qt.CheckState.Unchecked)
+                self._list.addItem(item)
+            layout.addWidget(self._list)
+
+            buttons = QDialogButtonBox(
+                QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+            )
+            buttons.accepted.connect(self._on_ok)
+            buttons.rejected.connect(self.reject)
+            layout.addWidget(buttons)
+
+        def _select_all(self):
+            for i in range(self._list.count()):
+                self._list.item(i).setCheckState(Qt.CheckState.Checked)
+
+        def _deselect_all(self):
+            for i in range(self._list.count()):
+                self._list.item(i).setCheckState(Qt.CheckState.Unchecked)
+
+        def _clear_filter(self):
+            self.result_set = None
+            self.accept()
+
+        def _on_ok(self):
+            self.result_set = set()
+            for i in range(self._list.count()):
+                item = self._list.item(i)
+                if item.checkState() == Qt.CheckState.Checked:
+                    self.result_set.add(item.text())
+            self.accept()
+
+    class FilterHeaderView(QHeaderView):
+        """Header view that supports right-click filter menus on filterable columns."""
+        filter_requested = Signal(int)
+
+        def __init__(self, orientation, parent=None):
+            super().__init__(orientation, parent)
+            self.setSectionsClickable(True)
+            self._filtered_columns: set[int] = set()
+
+        def set_filtered(self, col: int, is_filtered: bool):
+            if is_filtered:
+                self._filtered_columns.add(col)
+            else:
+                self._filtered_columns.discard(col)
+            self.viewport().update()
+
+        def mousePressEvent(self, event):
+            if event.button() == Qt.MouseButton.RightButton:
+                logical = self.logicalIndexAt(event.pos())
+                if logical in FILTERABLE_COLUMNS:
+                    menu = QMenu(self)
+                    col = logical
+                    action = QAction("Filter...", self)
+                    action.triggered.connect(lambda checked=False, c=col: self.filter_requested.emit(c))
+                    menu.addAction(action)
+                    if col in self._filtered_columns:
+                        clear_action = QAction("Clear this filter", self)
+                        clear_action.triggered.connect(lambda checked=False, c=col: self.filter_requested.emit(-c))
+                        menu.addAction(clear_action)
+                    menu.exec(event.globalPosition().toPoint())
+                    return
+            super().mousePressEvent(event)
 
     class WorkerThread(QThread):
         """Background worker thread for long-running operations."""
@@ -749,7 +959,7 @@ def run_gui():
 
     class MainWindow(QMainWindow):
         class ConnectionWorker(QThread):
-            finished = Signal(bool, object) # success, client or error_message
+            finished = Signal(bool, object)
 
             def __init__(self, parent, client_args, auth_method, auth_args):
                 super().__init__(parent)
@@ -770,10 +980,8 @@ def run_gui():
                         )
                     else:
                         error_message = "Invalid authentication method"
-                        
                 except Exception as e:
                     error_message = str(e)
-                    
                 if success:
                     self.finished.emit(True, client)
                 else:
@@ -784,180 +992,215 @@ def run_gui():
             self.client: Optional[VCDClient] = None
             self.shadow_vms: List[ShadowVM] = []
             self.worker: Optional[WorkerThread] = None
-            
+            self._select_all_state = False
+
             self.init_ui()
-            self.reset_connection_ui() # Initialize UI elements to disconnected state
+            self.reset_connection_ui()
 
         def init_ui(self):
             self.setWindowTitle("VMware Cloud Director Shadow VM Cleanup")
             self.setWindowIcon(QIcon("vcd_shadow_cleaner.svg"))
             self.setMinimumSize(1000, 700)
-            
-            # Central widget
+
             central_widget = QWidget()
             self.setCentralWidget(central_widget)
-            
+
             main_layout = QVBoxLayout(central_widget)
             main_layout.setSpacing(10)
             main_layout.setContentsMargins(15, 15, 15, 15)
-            
-            # Connection Group
+
+            # --- Connection Group ---
             conn_group = QGroupBox("VCD Connection")
             conn_layout = QFormLayout()
             conn_layout.setSpacing(8)
-            
+
             self.server_input = QLineEdit()
             self.server_input.setPlaceholderText("e.g., vcd.example.com")
             conn_layout.addRow("VCD Server:", self.server_input)
-            
-            # Auth type selection
+
             auth_layout = QHBoxLayout()
             self.auth_token_radio = QCheckBox("Use API Token")
-            self.auth_token_radio.setChecked(False)  # Unchecked by default
+            self.auth_token_radio.setChecked(False)
             self.auth_token_radio.stateChanged.connect(self.toggle_auth_mode)
             auth_layout.addWidget(self.auth_token_radio)
             auth_layout.addStretch()
             conn_layout.addRow("", auth_layout)
-            
+
             self.token_input = QLineEdit()
             self.token_input.setPlaceholderText("Enter VCD API Token")
             self.token_input.setEchoMode(QLineEdit.EchoMode.Password)
-            self.token_input.setVisible(False)  # Hidden by default
-            
-            # Create a label for the token input that we can also hide
+            self.token_input.setVisible(False)
             self.token_label = QLabel("API Token:")
             self.token_label.setVisible(False)
-            
             conn_layout.addRow(self.token_label, self.token_input)
-            
+
             self.username_input = QLineEdit()
             self.username_input.setPlaceholderText("Username")
-            self.username_input.setEnabled(True)  # Enabled by default
+            self.username_input.setEnabled(True)
             conn_layout.addRow("Username:", self.username_input)
-            
+
             self.password_input = QLineEdit()
             self.password_input.setPlaceholderText("Password")
             self.password_input.setEchoMode(QLineEdit.EchoMode.Password)
-            self.password_input.setEnabled(True)  # Enabled by default
-            
-            # Password toggle
+            self.password_input.setEnabled(True)
             self.show_password_check = QCheckBox("Show Password")
             self.show_password_check.stateChanged.connect(self.toggle_password_visibility)
-            self.show_password_check.setEnabled(True)  # Enabled by default
-            
+            self.show_password_check.setEnabled(True)
             pwd_layout = QHBoxLayout()
             pwd_layout.addWidget(self.password_input)
             pwd_layout.addWidget(self.show_password_check)
             conn_layout.addRow("Password:", pwd_layout)
-            
+
             self.skip_ssl_check = QCheckBox("Skip SSL Verification")
             conn_layout.addRow("", self.skip_ssl_check)
-            
+
             self.connect_btn = QPushButton("Connect to VCD")
             self.connect_btn.clicked.connect(self.connect_to_vcd)
             self.connect_btn.setMinimumHeight(35)
-            
             self.disconnect_btn = QPushButton("Disconnect")
             self.disconnect_btn.clicked.connect(self.disconnect_from_vcd)
             self.disconnect_btn.setMinimumHeight(35)
             self.disconnect_btn.setEnabled(False)
-            
             btn_layout_conn = QHBoxLayout()
             btn_layout_conn.addWidget(self.connect_btn)
             btn_layout_conn.addWidget(self.disconnect_btn)
             conn_layout.addRow("", btn_layout_conn)
-            
+
             conn_group.setLayout(conn_layout)
             main_layout.addWidget(conn_group)
-            
-            # Selection Group
+
+            # --- Selection Group ---
             select_group = QGroupBox("Selection")
             select_layout = QFormLayout()
             select_layout.setSpacing(8)
-            
+
             self.tenant_combo = QComboBox()
             self.tenant_combo.setEnabled(False)
             self.tenant_combo.currentTextChanged.connect(self.on_tenant_changed)
             select_layout.addRow("Tenant:", self.tenant_combo)
-            
-            self.catalog_combo = QComboBox()
-            self.catalog_combo.setEnabled(False)
-            select_layout.addRow("Catalog:", self.catalog_combo)
-            
+
+            catalog_container = QVBoxLayout()
+            catalog_btn_row = QHBoxLayout()
+            catalog_btn_row.setSpacing(4)
+            self.catalog_select_all_btn = QPushButton("Select All")
+            self.catalog_select_all_btn.setMaximumHeight(22)
+            self.catalog_select_all_btn.setEnabled(False)
+            self.catalog_select_all_btn.clicked.connect(self._catalog_select_all)
+            self.catalog_deselect_all_btn = QPushButton("Deselect All")
+            self.catalog_deselect_all_btn.setMaximumHeight(22)
+            self.catalog_deselect_all_btn.setEnabled(False)
+            self.catalog_deselect_all_btn.clicked.connect(self._catalog_deselect_all)
+            catalog_btn_row.addWidget(self.catalog_select_all_btn)
+            catalog_btn_row.addWidget(self.catalog_deselect_all_btn)
+            catalog_btn_row.addStretch()
+            catalog_container.addLayout(catalog_btn_row)
+
+            self.catalog_list = QListWidget()
+            self.catalog_list.setEnabled(False)
+            self.catalog_list.setSelectionMode(QListWidget.SelectionMode.NoSelection)
+            self.catalog_list.setMaximumHeight(120)
+            catalog_container.addWidget(self.catalog_list)
+
+            catalog_widget = QWidget()
+            catalog_widget.setLayout(catalog_container)
+            select_layout.addRow("Catalog(s):", catalog_widget)
+
             self.datastore_combo = QComboBox()
             self.datastore_combo.setEnabled(False)
             select_layout.addRow("Datastore:", self.datastore_combo)
-            
+
             btn_layout = QHBoxLayout()
             self.scan_btn = QPushButton("Scan for Shadow VMs")
             self.scan_btn.clicked.connect(self.scan_shadow_vms)
             self.scan_btn.setEnabled(False)
             self.scan_btn.setMinimumHeight(35)
             btn_layout.addWidget(self.scan_btn)
-            
+
             self.cleanup_btn = QPushButton("Cleanup Shadows")
             self.cleanup_btn.clicked.connect(self.cleanup_shadows)
             self.cleanup_btn.setEnabled(False)
             self.cleanup_btn.setMinimumHeight(35)
             self.cleanup_btn.setStyleSheet("background-color: #d32f2f; color: white;")
             btn_layout.addWidget(self.cleanup_btn)
-            
+
             select_layout.addRow("", btn_layout)
-            
             select_group.setLayout(select_layout)
             main_layout.addWidget(select_group)
-            
-            # Results Group
+
+            # --- Results Group ---
             results_group = QGroupBox("Shadow VMs Found")
             results_layout = QVBoxLayout()
-            
-            # Summary label
+
             self.summary_label = QLabel("No scan performed yet.")
             self.summary_label.setStyleSheet("font-weight: bold; padding: 5px;")
             results_layout.addWidget(self.summary_label)
-            
-            # Table
-            self.results_table = QTableWidget()
-            self.results_table.setColumnCount(4) # 1 for checkbox + 3 data columns
-            
-            # Create header item for the checkbox column with "Select All" text and checkbox
-            check_all_item = QTableWidgetItem("Select All")
-            check_all_item.setFlags(Qt.ItemFlag.ItemIsUserCheckable | Qt.ItemFlag.ItemIsEnabled)
-            check_all_item.setCheckState(Qt.CheckState.Unchecked) # Default to unchecked
-            self.results_table.setHorizontalHeaderItem(0, check_all_item)
-            
-            # Set other header labels
-            self.results_table.setHorizontalHeaderLabels([check_all_item.text(), "Parent Template", "Shadow VM Name", "Datastore"])
-            
-            # Adjust the first column width
-            self.results_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Fixed)
-            self.results_table.setColumnWidth(0, 80) # Sufficient width for checkbox and text
 
-            # Set other columns to stretch
-            self.results_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
-            self.results_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
-            self.results_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
+            # Filter button row
+            filter_row = QHBoxLayout()
+            filter_row.setSpacing(6)
+            filter_label = QLabel("Filters:")
+            filter_label.setStyleSheet("font-weight: bold; padding-right: 4px;")
+            filter_row.addWidget(filter_label)
 
+            self._filter_buttons: dict[int, QPushButton] = {}
+            for col in sorted(FILTERABLE_COLUMNS):
+                btn = QPushButton(f"{COLUMN_HEADERS[col]} \u25BC")
+                btn.setMaximumHeight(24)
+                btn.setStyleSheet("font-size: 11px; padding: 2px 8px;")
+                btn.clicked.connect(lambda checked=False, c=col: self._on_filter_requested(c))
+                filter_row.addWidget(btn)
+                self._filter_buttons[col] = btn
+
+            clear_all_btn = QPushButton("Clear All Filters")
+            clear_all_btn.setMaximumHeight(24)
+            clear_all_btn.setStyleSheet("font-size: 11px; padding: 2px 8px;")
+            clear_all_btn.clicked.connect(self._clear_all_filters)
+            filter_row.addWidget(clear_all_btn)
+
+            filter_row.addStretch()
+            results_layout.addLayout(filter_row)
+
+            # Source model
+            self._source_model = QStandardItemModel(0, len(COLUMN_HEADERS))
+            self._source_model.setHorizontalHeaderLabels(COLUMN_HEADERS)
+
+            # Proxy model for filtering
+            self._proxy_model = ColumnFilterProxyModel()
+            self._proxy_model.setSourceModel(self._source_model)
+            self._proxy_model.setDynamicSortFilter(True)
+
+            # Table view
+            self.results_table = QTableView()
+            self.results_table.setModel(self._proxy_model)
             self.results_table.setAlternatingRowColors(True)
-            self.results_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
-            self.results_table.setSortingEnabled(True) # Enable sorting
-            
-            # Connect the "Check/Uncheck All" header checkbox
-            self.results_table.horizontalHeader().sectionClicked.connect(self.toggle_all_shadow_vms_selection_from_header)
-            # Connect itemChanged signal to update the selected VMs count
-            self.results_table.itemChanged.connect(self.update_selected_vms_count)
+            self.results_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+            self.results_table.setSortingEnabled(True)
+            self.results_table.verticalHeader().setVisible(False)
+
+            # Custom header
+            header = FilterHeaderView(Qt.Orientation.Horizontal, self.results_table)
+            self.results_table.setHorizontalHeader(header)
+            header.setSectionsClickable(True)
+            header.sectionClicked.connect(self._on_header_clicked)
+            header.filter_requested.connect(self._on_filter_requested)
+
+            header.setSectionResizeMode(COL_CHECK, QHeaderView.ResizeMode.Fixed)
+            self.results_table.setColumnWidth(COL_CHECK, 40)
+            for c in (COL_CATALOG, COL_TEMPLATE, COL_VMNAME, COL_DATASTORE):
+                header.setSectionResizeMode(c, QHeaderView.ResizeMode.Stretch)
+
+            self._source_model.itemChanged.connect(self._on_item_changed)
 
             results_layout.addWidget(self.results_table)
-            
             results_group.setLayout(results_layout)
             main_layout.addWidget(results_group, stretch=1)
-            
-            # Progress bar
+
+            # --- Progress bar ---
             self.progress_bar = QProgressBar()
             self.progress_bar.setVisible(False)
             main_layout.addWidget(self.progress_bar)
-            
-            # Log area
+
+            # --- Log area ---
             log_group = QGroupBox("Log")
             log_layout = QVBoxLayout()
             self.log_text = QTextEdit()
@@ -967,85 +1210,142 @@ def run_gui():
             log_layout.addWidget(self.log_text)
             log_group.setLayout(log_layout)
             main_layout.addWidget(log_group)
-            
-            # Status bar
+
             self.statusBar().showMessage("Ready")
 
+        # ---- helpers ----
+
         def log(self, message: str):
-            """Add a message to the log."""
             timestamp = datetime.now().strftime("%H:%M:%S")
             self.log_text.append(f"[{timestamp}] {message}")
 
-        def update_selected_vms_count(self):
-            """Update the status bar with the count of selected Shadow VMs."""
-            selected_count = 0
-            for row in range(self.results_table.rowCount()):
-                checkbox_item = self.results_table.item(row, 0)
-                if checkbox_item and checkbox_item.checkState() == Qt.CheckState.Checked:
-                    selected_count += 1
-            self.statusBar().showMessage(f"Selected Shadow VMs: {selected_count}")
+        def _get_all_column_values(self, col: int) -> list[str]:
+            """Collect all unique values from the source model for a column."""
+            values = []
+            for row in range(self._source_model.rowCount()):
+                item = self._source_model.item(row, col)
+                if item:
+                    values.append(item.text())
+            return values
+
+        def _on_header_clicked(self, logical_index: int):
+            if logical_index == COL_CHECK:
+                self._toggle_all_visible_checkboxes()
+
+        def _toggle_all_visible_checkboxes(self):
+            self._select_all_state = not self._select_all_state
+            new_check = Qt.CheckState.Checked if self._select_all_state else Qt.CheckState.Unchecked
+            self._source_model.blockSignals(True)
+            for proxy_row in range(self._proxy_model.rowCount()):
+                source_idx = self._proxy_model.mapToSource(self._proxy_model.index(proxy_row, COL_CHECK))
+                item = self._source_model.itemFromIndex(source_idx)
+                if item:
+                    item.setCheckState(new_check)
+            self._source_model.blockSignals(False)
+            self._update_selected_count()
+
+        def _on_filter_requested(self, col_signal: int):
+            header = self.results_table.horizontalHeader()
+            if col_signal <= 0:
+                col = -col_signal
+                self._proxy_model.set_column_filter(col, None)
+                header.set_filtered(col, False)
+                self._update_filter_button(col, False)
+                self._update_summary()
+                return
+
+            col = col_signal
+            all_values = self._get_all_column_values(col)
+            current_filters = self._proxy_model.active_filters()
+            current_checked = current_filters.get(col)
+
+            dlg = FilterPopupDialog(self, COLUMN_HEADERS[col], all_values, current_checked)
+            if dlg.exec() == QDialog.DialogCode.Accepted:
+                result = dlg.result_set
+                if result is None:
+                    self._proxy_model.set_column_filter(col, None)
+                    header.set_filtered(col, False)
+                    self._update_filter_button(col, False)
+                else:
+                    all_unique = set(all_values)
+                    is_filtered = result != all_unique
+                    self._proxy_model.set_column_filter(col, result)
+                    header.set_filtered(col, is_filtered)
+                    self._update_filter_button(col, is_filtered)
+                self._update_summary()
+
+        def _clear_all_filters(self):
+            self._proxy_model.clear_all_filters()
+            header = self.results_table.horizontalHeader()
+            for c in FILTERABLE_COLUMNS:
+                header.set_filtered(c, False)
+                self._update_filter_button(c, False)
+            self._update_summary()
+
+        def _update_filter_button(self, col: int, is_filtered: bool):
+            btn = self._filter_buttons.get(col)
+            if btn:
+                name = COLUMN_HEADERS[col]
+                if is_filtered:
+                    btn.setText(f"{name} \u25BC *")
+                    btn.setStyleSheet("font-size: 11px; padding: 2px 8px; color: #4fc3f7; font-weight: bold;")
+                else:
+                    btn.setText(f"{name} \u25BC")
+                    btn.setStyleSheet("font-size: 11px; padding: 2px 8px;")
+
+        def _on_item_changed(self, item: QStandardItem):
+            if item.column() == COL_CHECK:
+                self._update_selected_count()
+
+        def _update_selected_count(self):
+            selected = 0
+            for row in range(self._source_model.rowCount()):
+                chk = self._source_model.item(row, COL_CHECK)
+                if chk and chk.checkState() == Qt.CheckState.Checked:
+                    selected += 1
+            self.statusBar().showMessage(f"Selected Shadow VMs: {selected}")
+
+        def _update_summary(self):
+            total = self._source_model.rowCount()
+            visible = self._proxy_model.rowCount()
+            if total == visible:
+                self.summary_label.setText(f"Found {total} Shadow VMs")
+            else:
+                self.summary_label.setText(f"Showing {visible} of {total} Shadow VMs (filtered)")
+
+        # ---- auth toggles ----
 
         def toggle_auth_mode(self, state):
-            """Toggle between token and username/password authentication."""
-            # Directly use the 'state' argument from stateChanged signal
             use_token = state == Qt.CheckState.Checked.value
-            
-            # Toggle visibility of token fields
             self.token_input.setVisible(use_token)
             self.token_label.setVisible(use_token)
             self.token_input.setEnabled(use_token)
-            
-            # Toggle enablement of username/password fields
             self.username_input.setEnabled(not use_token)
             self.password_input.setEnabled(not use_token)
             self.show_password_check.setEnabled(not use_token)
 
         def toggle_password_visibility(self, state):
-            """Toggle password visibility."""
             checked = state == Qt.CheckState.Checked.value
             mode = QLineEdit.EchoMode.Normal if checked else QLineEdit.EchoMode.Password
             self.password_input.setEchoMode(mode)
 
-        def toggle_all_shadow_vms_selection_from_header(self, logical_index):
-            """Toggle all checkboxes in the Shadow VMs table when the header checkbox is clicked."""
-            if logical_index == 0:  # Only for the first column (checkbox column)
-                header_item = self.results_table.horizontalHeaderItem(0)
-                if header_item and header_item.flags() & Qt.ItemFlag.ItemIsUserCheckable:
-                    # Check if the header checkbox is checked
-                    if header_item.checkState() == Qt.CheckState.Checked:
-                        new_state = Qt.CheckState.Unchecked
-                    else:
-                        new_state = Qt.CheckState.Checked
-                    
-                    header_item.setCheckState(new_state) # Update the header checkbox state
-                    
-                    # Update all row checkboxes
-                    for row in range(self.results_table.rowCount()):
-                        item = self.results_table.item(row, 0)
-                        if item:
-                            item.setCheckState(new_state)
-                    # Update status bar after toggling all
-                    self.update_selected_vms_count()
+        # ---- connection ----
 
         def connect_to_vcd(self):
-            """Initiate VCD connection in a worker thread."""
             server = self.server_input.text().strip()
             if not server:
                 QMessageBox.warning(self, "Error", "Please enter a VCD server address.")
                 return
-            
+
             self.log(f"Attempting to connect to {server}...")
             self.statusBar().showMessage("Connecting...")
             self.connect_btn.setText("Connecting...")
             self.connect_btn.setEnabled(False)
-            self.disconnect_btn.setEnabled(False) # Disable disconnect during connection attempt
+            self.disconnect_btn.setEnabled(False)
             self.progress_bar.setVisible(True)
-            self.progress_bar.setRange(0, 0) # Indeterminate
-            
-            # Create client arguments
-            client_args = (server, not self.skip_ssl_check.isChecked())
+            self.progress_bar.setRange(0, 0)
 
-            # Determine authentication method and arguments
+            client_args = (server, not self.skip_ssl_check.isChecked())
             auth_method = ""
             auth_args = {}
 
@@ -1067,17 +1367,14 @@ def run_gui():
                 auth_method = "credentials"
                 auth_args = {"username": username, "password": password}
 
-            # Start connection in a worker thread
             self.connection_worker = self.ConnectionWorker(self, client_args, auth_method, auth_args)
             self.connection_worker.finished.connect(self.on_connection_finished)
             self.connection_worker.start()
 
         def on_connection_finished(self, success: bool, result_or_error):
-            """Handle connection completion from worker thread."""
             self.progress_bar.setVisible(False)
-            
             if success:
-                self.client = result_or_error  # The client object is passed on success
+                self.client = result_or_error
                 self.log("Connected successfully!")
                 self.statusBar().showMessage("Connected")
                 self.connect_btn.setText("Connected")
@@ -1086,78 +1383,67 @@ def run_gui():
                 self.disconnect_btn.setEnabled(True)
                 self.load_dropdowns()
             else:
-                error_message = result_or_error # Error message on failure
+                error_message = result_or_error
                 self.log(f"Connection failed: {error_message}")
                 self.statusBar().showMessage("Connection failed")
                 QMessageBox.critical(self, "Error", f"Failed to connect to VCD: {error_message}")
-                self.reset_connection_ui() # Reset UI on failure
+                self.reset_connection_ui()
 
         def disconnect_from_vcd(self):
-            """Disconnect from VCD and reset UI."""
             if self.client:
                 self.client.disconnect()
                 self.client = None
-            
             self.log("Disconnected.")
             self.statusBar().showMessage("Disconnected")
-            
             self.reset_connection_ui()
 
         def reset_connection_ui(self):
-            """Resets the connection UI elements to their initial state."""
             self.connect_btn.setText("Connect to VCD")
-            self.connect_btn.setStyleSheet("") # Reset stylesheet to default
+            self.connect_btn.setStyleSheet("")
             self.connect_btn.setEnabled(True)
             self.disconnect_btn.setEnabled(False)
             self.progress_bar.setVisible(False)
-            
+
             self.tenant_combo.clear()
             self.tenant_combo.setEnabled(False)
-            self.catalog_combo.clear()
-            self.catalog_combo.setEnabled(False)
+            self.catalog_list.clear()
+            self.catalog_list.setEnabled(False)
+            self.catalog_select_all_btn.setEnabled(False)
+            self.catalog_deselect_all_btn.setEnabled(False)
             self.datastore_combo.clear()
             self.datastore_combo.setEnabled(False)
-            
+
             self.scan_btn.setEnabled(False)
             self.cleanup_btn.setEnabled(False)
-            
-            self.results_table.setRowCount(0)
+
+            self._source_model.removeRows(0, self._source_model.rowCount())
+            self._proxy_model.clear_all_filters()
+            header = self.results_table.horizontalHeader()
+            for c in FILTERABLE_COLUMNS:
+                header.set_filtered(c, False)
+                self._update_filter_button(c, False)
+            self._select_all_state = False
             self.summary_label.setText("No scan performed yet.")
 
+        # ---- dropdowns ----
+
         def load_dropdowns(self):
-            """Load tenant, catalog, and datastore dropdowns."""
             if not self.client:
                 return
-            
+
             self.log("Loading organizations...")
-            
-            # Load organizations
             orgs = self.client.get_organizations()
             self.tenant_combo.clear()
             self.tenant_combo.addItem("-- Select Tenant --")
             for org in orgs:
                 self.tenant_combo.addItem(org["name"])
             self.tenant_combo.setEnabled(True)
-            
-            # Load catalogs
+
             self.log("Loading catalogs...")
             catalogs = self.client.get_catalogs()
-            self.catalog_combo.clear()
-            self.catalog_combo.addItem("-- Select Catalog --")
-            for catalog in catalogs:
-                # Build display name with sharing info
-                flags = []
-                if catalog.get('isShared'):
-                    flags.append("Shared")
-                if catalog.get('isPublished'):
-                    flags.append("Published")
-                flag_str = f" [{', '.join(flags)}]" if flags else ""
-                display_name = f"{catalog['name']} ({catalog.get('orgName', 'N/A')}){flag_str}"
-                self.catalog_combo.addItem(display_name, catalog['name'])
-            self.catalog_combo.setEnabled(True)
+            self._populate_catalog_list(catalogs)
             self.log(f"Loaded {len(catalogs)} catalogs")
-            
-            # Load datastores
+
             self.log("Loading datastores...")
             datastores = self.client.get_datastores()
             self.datastore_combo.clear()
@@ -1165,128 +1451,151 @@ def run_gui():
             for ds in datastores:
                 self.datastore_combo.addItem(ds["name"])
             self.datastore_combo.setEnabled(True)
-            
+
             self.scan_btn.setEnabled(True)
             self.log("Ready to scan.")
 
         def on_tenant_changed(self, tenant_name: str):
-            """Handle tenant selection change - reload catalogs for the selected tenant."""
             if self.client and tenant_name and not tenant_name.startswith("--"):
                 self.client.switch_to_org(tenant_name)
                 self.log(f"Switched to tenant: {tenant_name}")
-                
-                # Reload catalogs for this tenant
                 self.log(f"Loading catalogs for tenant '{tenant_name}'...")
                 self.statusBar().showMessage(f"Loading catalogs for {tenant_name}...")
                 QApplication.processEvents()
-                
+
                 catalogs = self.client.get_catalogs(org_name=tenant_name)
-                self.catalog_combo.clear()
-                self.catalog_combo.addItem("-- Select Catalog --")
-                for catalog in catalogs:
-                    flags = []
-                    if catalog.get('isShared'):
-                        flags.append("Shared")
-                    if catalog.get('isPublished'):
-                        flags.append("Published")
-                    flag_str = f" [{', '.join(flags)}]" if flags else ""
-                    display_name = f"{catalog['name']} ({catalog.get('orgName', 'N/A')}){flag_str}"
-                    self.catalog_combo.addItem(display_name, catalog['name'])
-                
+                self._populate_catalog_list(catalogs)
                 self.log(f"Loaded {len(catalogs)} catalogs for tenant '{tenant_name}'")
                 self.statusBar().showMessage("Ready")
 
+        def _populate_catalog_list(self, catalogs: list):
+            self.catalog_list.clear()
+            for catalog in catalogs:
+                flags = []
+                if catalog.get('isShared'):
+                    flags.append("Shared")
+                if catalog.get('isPublished'):
+                    flags.append("Published")
+                flag_str = f" [{', '.join(flags)}]" if flags else ""
+                display_name = f"{catalog['name']} ({catalog.get('orgName', 'N/A')}){flag_str}"
+                item = QListWidgetItem(display_name)
+                item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+                item.setCheckState(Qt.CheckState.Unchecked)
+                item.setData(Qt.ItemDataRole.UserRole, catalog['name'])
+                self.catalog_list.addItem(item)
+            self.catalog_list.setEnabled(True)
+            self.catalog_select_all_btn.setEnabled(True)
+            self.catalog_deselect_all_btn.setEnabled(True)
+
+        def _catalog_select_all(self):
+            for i in range(self.catalog_list.count()):
+                self.catalog_list.item(i).setCheckState(Qt.CheckState.Checked)
+
+        def _catalog_deselect_all(self):
+            for i in range(self.catalog_list.count()):
+                self.catalog_list.item(i).setCheckState(Qt.CheckState.Unchecked)
+
+        def _get_selected_catalog_names(self) -> list:
+            selected = []
+            for i in range(self.catalog_list.count()):
+                item = self.catalog_list.item(i)
+                if item.checkState() == Qt.CheckState.Checked:
+                    selected.append(item.data(Qt.ItemDataRole.UserRole))
+            return selected
+
+        # ---- scan ----
+
         def scan_shadow_vms(self):
-            """Scan for Shadow VMs."""
             if not self.client:
                 return
-            
-            catalog_idx = self.catalog_combo.currentIndex()
-            if catalog_idx <= 0:
-                QMessageBox.warning(self, "Error", "Please select a catalog.")
+
+            selected_catalogs = self._get_selected_catalog_names()
+            if not selected_catalogs:
+                QMessageBox.warning(self, "Error", "Please select at least one catalog.")
                 return
-            
+
             datastore_name = self.datastore_combo.currentText()
             if not datastore_name or datastore_name.startswith("--"):
                 QMessageBox.warning(self, "Error", "Please select a datastore.")
                 return
-            
-            catalog_name = self.catalog_combo.itemData(catalog_idx) or self.catalog_combo.currentText().split(" (")[0]
-            
-            self.log(f"Scanning catalog '{catalog_name}' on datastore '{datastore_name}'...")
+
+            self.log(f"Scanning {len(selected_catalogs)} catalog(s) on datastore '{datastore_name}'...")
             self.statusBar().showMessage("Scanning...")
             self.scan_btn.setEnabled(False)
             self.progress_bar.setVisible(True)
-            self.progress_bar.setRange(0, 0)  # Indeterminate
+            self.progress_bar.setRange(0, 0)
             QApplication.processEvents()
-            
-            # Perform scan
+
             self.shadow_vms = scan_shadow_vms(
-                self.client, catalog_name, datastore_name, debug=False
+                self.client, selected_catalogs, datastore_name, debug=False
             )
-            
-            # Reset "Select All" checkbox
-            header_checkbox = self.results_table.horizontalHeaderItem(0)
-            if header_checkbox:
-                header_checkbox.setCheckState(Qt.CheckState.Unchecked)
 
-            # Update table
-            self.results_table.setRowCount(len(self.shadow_vms))
-            self.results_table.setSortingEnabled(False) # Disable sorting temporarily
-            for row, shadow in enumerate(sorted(self.shadow_vms, key=lambda s: s.container_name.lower() if s.container_name else ''), start=0):
-                # Checkbox column
-                checkbox_item = QTableWidgetItem()
-                checkbox_item.setFlags(Qt.ItemFlag.ItemIsUserCheckable | Qt.ItemFlag.ItemIsEnabled)
-                checkbox_item.setCheckState(Qt.CheckState.Unchecked) # Default to unchecked
-                self.results_table.setItem(row, 0, checkbox_item)
+            # Clear filters and rebuild model
+            self._proxy_model.clear_all_filters()
+            header = self.results_table.horizontalHeader()
+            for c in FILTERABLE_COLUMNS:
+                header.set_filtered(c, False)
+                self._update_filter_button(c, False)
+            self._select_all_state = False
 
-                # Parent Template column
-                parent_template_item = QTableWidgetItem(shadow.container_name)
-                parent_template_item.setData(Qt.ItemDataRole.UserRole, shadow) # Store full object
-                self.results_table.setItem(row, 1, parent_template_item)
+            self._source_model.removeRows(0, self._source_model.rowCount())
 
-                # Shadow VM Name column
-                self.results_table.setItem(row, 2, QTableWidgetItem(shadow.name))
-                
-                # Datastore column
-                self.results_table.setItem(row, 3, QTableWidgetItem(shadow.datastore_name))
-            self.results_table.setSortingEnabled(True) # Re-enable sorting
-            # Update summary
-            self.summary_label.setText(
-                f"Found {len(self.shadow_vms)} Shadow VMs"
+            sorted_shadows = sorted(
+                self.shadow_vms,
+                key=lambda s: (s.catalog_name.lower(), s.container_name.lower() if s.container_name else '')
             )
-            
+
+            for shadow in sorted_shadows:
+                chk_item = QStandardItem()
+                chk_item.setCheckable(True)
+                chk_item.setCheckState(Qt.CheckState.Unchecked)
+                chk_item.setEditable(False)
+
+                cat_item = QStandardItem(shadow.catalog_name)
+                cat_item.setData(shadow, SHADOW_VM_ROLE)
+                cat_item.setEditable(False)
+
+                tpl_item = QStandardItem(shadow.container_name)
+                tpl_item.setEditable(False)
+
+                vm_item = QStandardItem(shadow.name)
+                vm_item.setEditable(False)
+
+                ds_item = QStandardItem(shadow.datastore_name)
+                ds_item.setEditable(False)
+
+                self._source_model.appendRow([chk_item, cat_item, tpl_item, vm_item, ds_item])
+
+            self._source_model.setHorizontalHeaderLabels(COLUMN_HEADERS)
+
+            self.summary_label.setText(f"Found {len(self.shadow_vms)} Shadow VMs")
             self.progress_bar.setVisible(False)
             self.scan_btn.setEnabled(True)
             self.cleanup_btn.setEnabled(len(self.shadow_vms) > 0)
             self.statusBar().showMessage(f"Scan complete: {len(self.shadow_vms)} Shadow VMs found")
             self.log(f"Scan complete: {len(self.shadow_vms)} Shadow VMs")
-            
-            # Update the selected VMs count in the status bar
-            self.update_selected_vms_count()
+            self._update_selected_count()
+
+        # ---- cleanup ----
 
         def cleanup_shadows(self):
-            """Delete the found Shadow VMs."""
             if not self.client:
                 return
-            
-            # Get selected Shadow VMs from the table
+
             selected_shadow_vms = []
-            for row in range(self.results_table.rowCount()):
-                checkbox_item = self.results_table.item(row, 0)
-                if checkbox_item and checkbox_item.checkState() == Qt.CheckState.Checked:
-                    # Retrieve the ShadowVM object stored in the Parent Template column's UserRole
-                    item_with_data = self.results_table.item(row, 1)
-                    if item_with_data:
-                        shadow = item_with_data.data(Qt.ItemDataRole.UserRole)
+            for row in range(self._source_model.rowCount()):
+                chk = self._source_model.item(row, COL_CHECK)
+                if chk and chk.checkState() == Qt.CheckState.Checked:
+                    cat_item = self._source_model.item(row, COL_CATALOG)
+                    if cat_item:
+                        shadow = cat_item.data(SHADOW_VM_ROLE)
                         if shadow:
                             selected_shadow_vms.append(shadow)
-            
+
             if not selected_shadow_vms:
                 QMessageBox.information(self, "No Selection", "No Shadow VMs selected for deletion.")
                 return
-            
-            # Confirm
+
             reply = QMessageBox.question(
                 self, "Confirm Deletion",
                 f"Are you sure you want to delete {len(selected_shadow_vms)} selected Shadow VMs?\n\n"
@@ -1294,10 +1603,9 @@ def run_gui():
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                 QMessageBox.StandardButton.No
             )
-            
             if reply != QMessageBox.StandardButton.Yes:
                 return
-            
+
             self.log("Starting Shadow VM deletion...")
             self.statusBar().showMessage("Deleting Shadow VMs...")
             self.cleanup_btn.setEnabled(False)
@@ -1305,64 +1613,55 @@ def run_gui():
             self.progress_bar.setVisible(True)
             self.progress_bar.setRange(0, len(selected_shadow_vms))
             self.progress_bar.setValue(0)
-            
+
             success_count = 0
             fail_count = 0
-            
-            # Store rows to remove after deletion to avoid index issues
-            rows_to_remove = []
+            deleted_shadows = set()
 
             for i, shadow in enumerate(selected_shadow_vms):
                 self.progress_bar.setValue(i + 1)
                 self.statusBar().showMessage(f"Deleting {i+1}/{len(selected_shadow_vms)}: {shadow.name}")
                 QApplication.processEvents()
-                
+
                 success, message = self.client.delete_shadow_vm(shadow)
                 if success:
                     self.log(f"Deleted: {shadow.name}")
                     success_count += 1
-                    # Mark row for removal
-                    for row in range(self.results_table.rowCount()):
-                        item_with_data = self.results_table.item(row, 1)
-                        if item_with_data and item_with_data.data(Qt.ItemDataRole.UserRole) == shadow:
-                            rows_to_remove.append(row)
-                            break
+                    deleted_shadows.add(id(shadow))
                 else:
                     self.log(f"Failed: {shadow.name} - {message}")
                     fail_count += 1
-                
-                # Add a 3-second delay to prevent VCD from being overwhelmed
-                if i < len(selected_shadow_vms) - 1: # Don't sleep after the last item
+
+                if i < len(selected_shadow_vms) - 1:
                     time.sleep(3)
-            
-            # Remove deleted rows from table (in reverse order to avoid index shifting)
-            rows_to_remove.sort(reverse=True)
-            for row in rows_to_remove:
-                self.results_table.removeRow(row)
-            
-            # Update internal self.shadow_vms list as well
-            self.shadow_vms = [s for s in self.shadow_vms if s not in selected_shadow_vms]
+
+            # Remove deleted rows from source model (reverse to preserve indices)
+            rows_to_remove = []
+            for row in range(self._source_model.rowCount()):
+                cat_item = self._source_model.item(row, COL_CATALOG)
+                if cat_item:
+                    s = cat_item.data(SHADOW_VM_ROLE)
+                    if s and id(s) in deleted_shadows:
+                        rows_to_remove.append(row)
+            for row in reversed(rows_to_remove):
+                self._source_model.removeRow(row)
+
+            self.shadow_vms = [s for s in self.shadow_vms if id(s) not in deleted_shadows]
 
             self.progress_bar.setVisible(False)
             self.scan_btn.setEnabled(True)
             self.cleanup_btn.setEnabled(len(self.shadow_vms) > 0)
-            
-            # Update summary
-            self.summary_label.setText(f"Found {len(self.shadow_vms)} Shadow VMs")
-
+            self._update_summary()
             self.statusBar().showMessage(f"Deletion complete: {success_count} succeeded, {fail_count} failed")
             self.log(f"Deletion complete: {success_count} succeeded, {fail_count} failed")
-            
-            # Update the selected VMs count in the status bar after cleanup
-            self.update_selected_vms_count()
-            
+            self._update_selected_count()
+
             QMessageBox.information(
                 self, "Deletion Complete",
                 f"Deletion complete!\n\nSuccessful: {success_count}\nFailed: {fail_count}"
             )
 
         def closeEvent(self, event):
-            """Handle window close."""
             if self.client and self.client.access_token:
                 self.client.disconnect()
             event.accept()
@@ -1370,8 +1669,7 @@ def run_gui():
     # Run the application
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
-    
-    # Set dark theme
+
     palette = QPalette()
     palette.setColor(QPalette.ColorRole.Window, QColor(53, 53, 53))
     palette.setColor(QPalette.ColorRole.WindowText, QColor(255, 255, 255))
@@ -1387,10 +1685,10 @@ def run_gui():
     palette.setColor(QPalette.ColorRole.Highlight, QColor(42, 130, 218))
     palette.setColor(QPalette.ColorRole.HighlightedText, QColor(0, 0, 0))
     app.setPalette(palette)
-    
+
     window = MainWindow()
     window.show()
-    
+
     return app.exec()
 
 
